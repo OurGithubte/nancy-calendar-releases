@@ -1,0 +1,101 @@
+name: Publish Android release
+
+# CI của repo nguồn (private) đẩy APK đã ký + version.json lên nhánh
+# incoming/vX.Y.Z bằng SSH deploy key. Workflow này kiểm tra lại rồi tạo
+# GitHub Release bằng GITHUB_TOKEN của chính repo này (không cần PAT), sau đó
+# xoá nhánh incoming.
+
+on:
+  push:
+    branches: ["incoming/v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_ID: com.nancycalendar.app
+  # Chứng chỉ ký production (công khai, không phải bí mật). Chặn mọi APK ký bằng key khác.
+  EXPECTED_CERT_SHA256: cb797b0b2272b06f8279ca41d48131540be7aee4df342370a8bee1603aad2dbd
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify incoming release
+        id: meta
+        run: |
+          TAG="${GITHUB_REF_NAME#incoming/}"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Nhánh không hợp lệ: $GITHUB_REF_NAME"; exit 1; }
+          VERSION="${TAG#v}"
+          APK_NAME="Nancy-Calendar-$TAG.apk"
+          APK="incoming/$APK_NAME"
+          test -s "$APK" && test -s incoming/version.json && test -s incoming/RELEASE_NOTES.md
+
+          node - "$VERSION" "$APK_NAME" <<'JS'
+          const [version, apkName] = process.argv.slice(2);
+          const m = require(process.cwd() + "/incoming/version.json");
+          const [a, b, c] = version.split(".").map(Number);
+          const expectUrl = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${version}/${apkName}`;
+          const errors = [];
+          if (m.packageName !== process.env.PACKAGE_ID) errors.push("packageName");
+          if (m.version !== version) errors.push("version");
+          if (m.versionCode !== a * 10000 + b * 100 + c) errors.push("versionCode");
+          if (m.apkUrl !== expectUrl) errors.push(`apkUrl (${m.apkUrl} != ${expectUrl})`);
+          if (!/^[0-9a-f]{64}$/.test(m.sha256)) errors.push("sha256");
+          if (!Array.isArray(m.notes) || m.notes.length === 0) errors.push("notes");
+          if (errors.length) { console.error("version.json sai:", errors.join(", ")); process.exit(1); }
+          console.log("version.json OK", m.version, m.versionCode);
+          JS
+
+          EXPECTED_SHA="$(node -p 'require("./incoming/version.json").sha256')"
+          echo "$EXPECTED_SHA  $APK" | sha256sum -c -
+          test "$(stat -c %s "$APK")" = "$(node -p 'require("./incoming/version.json").size')"
+
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)"
+          CODE="$(node -p 'require("./incoming/version.json").versionCode')"
+          "$BT/aapt2" dump badging "$APK" | grep -q "package: name='$PACKAGE_ID' versionCode='$CODE' versionName='$VERSION'" \
+            || { echo "::error::package/version trong APK không khớp"; exit 1; }
+          CERT="$("$BT/apksigner" verify --print-certs "$APK" | sed -n 's/^Signer #1 certificate SHA-256 digest: //p' | head -n 1)"
+          [ "$CERT" = "$EXPECTED_CERT_SHA256" ] || { echo "::error::Chứng chỉ ký sai: $CERT"; exit 1; }
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release $TAG đã tồn tại — không ghi đè."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --target main \
+            --title "Nancy Calendar ${{ steps.meta.outputs.tag }}" \
+            --notes-file incoming/RELEASE_NOTES.md \
+            --latest \
+            "${{ steps.meta.outputs.apk }}" incoming/version.json
+
+      - name: Verify public download
+        run: |
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/version.json" -o /tmp/v.json \
+              && [ "v$(node -p 'require("/tmp/v.json").version')" = "${{ steps.meta.outputs.tag }}" ] && break
+            sleep 10
+          done
+          [ "v$(node -p 'require("/tmp/v.json").version')" = "${{ steps.meta.outputs.tag }}" ]
+          curl -fsSL "$(node -p 'require("/tmp/v.json").apkUrl')" -o /tmp/app.apk
+          echo "$(node -p 'require("/tmp/v.json").sha256')  /tmp/app.apk" | sha256sum -c -
+
+      - name: Delete incoming branch
+        if: always()
+        run: git push origin --delete "$GITHUB_REF_NAME" || true
