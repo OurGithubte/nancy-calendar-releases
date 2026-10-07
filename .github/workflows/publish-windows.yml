@@ -1,0 +1,112 @@
+name: Publish Windows release
+
+# CI của repo nguồn (private) build installer Windows trên Windows runner, ký
+# updater (Tauri/minisign) rồi đẩy lên nhánh incoming-windows/vX.Y.Z bằng SSH
+# deploy key. Workflow này kiểm tra lại (SHA-256, chữ ký bằng public key cố định,
+# latest.json) rồi đính kèm vào CHÍNH Release vX.Y.Z mà luồng Android đã tạo —
+# không tạo/sửa version.json của Android. Không cần PAT.
+
+on:
+  push:
+    branches: ["incoming-windows/v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify incoming Windows release
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME#incoming-windows/}"
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Nhánh không hợp lệ: $GITHUB_REF_NAME"; exit 1; }
+          VERSION="${TAG#v}"
+          D=incoming-windows
+          SETUP="Nancy-Calendar-Windows-$TAG-Setup.exe"
+          MSI="Nancy-Calendar-Windows-$TAG.msi"
+          for f in "$SETUP" "$SETUP.sig" "$MSI" "$MSI.sig" latest.json SHA256SUMS-Windows.txt RELEASE_NOTES-Windows.md; do
+            test -s "$D/$f" || { echo "::error::Thiếu $f"; exit 1; }
+          done
+          (cd "$D" && sha256sum -c SHA256SUMS-Windows.txt)
+          node scripts/verify-updater-signature.mjs "$D/$SETUP" "$D/$SETUP.sig"
+          node scripts/verify-updater-signature.mjs "$D/$MSI" "$D/$MSI.sig"
+
+          node - "$VERSION" "$SETUP" "$MSI" <<'JS'
+          const fs = require("fs");
+          const [version, setup, msi] = process.argv.slice(2);
+          const d = process.cwd() + "/incoming-windows/";
+          const m = JSON.parse(fs.readFileSync(d + "latest.json", "utf8"));
+          const base = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/v${version}/`;
+          const sig = (f) => fs.readFileSync(d + f + ".sig", "utf8").trim();
+          const errors = [];
+          if (m.version !== version) errors.push("version");
+          if (typeof m.notes !== "string" || !m.notes.trim()) errors.push("notes");
+          if (Number.isNaN(Date.parse(m.pub_date))) errors.push("pub_date");
+          const expect = {
+            "windows-x86_64": [setup, base + setup],
+            "windows-x86_64-nsis": [setup, base + setup],
+            "windows-x86_64-msi": [msi, base + msi],
+          };
+          for (const [key, [file, url]] of Object.entries(expect)) {
+            const p = m.platforms?.[key];
+            if (!p) { errors.push(`platforms.${key}`); continue; }
+            if (p.url !== url) errors.push(`${key}.url (${p.url} != ${url})`);
+            if (p.signature !== sig(file)) errors.push(`${key}.signature`);
+          }
+          if (errors.length) { console.error("latest.json sai:", errors.join(", ")); process.exit(1); }
+          console.log("latest.json OK", m.version);
+          JS
+
+          # Release vX.Y.Z do luồng Android tạo; bản Windows chỉ được thêm vào, không ghi đè.
+          gh release view "$TAG" --json tagName >/dev/null || { echo "::error::Chưa có Release $TAG"; exit 1; }
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx "$SETUP\|latest.json"; then
+            echo "::error::Release $TAG đã có asset Windows — không ghi đè."
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "setup=$SETUP" >> "$GITHUB_OUTPUT"
+
+      - name: Attach Windows assets to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          cd incoming-windows
+          gh release upload "$TAG" \
+            "Nancy-Calendar-Windows-$TAG-Setup.exe" "Nancy-Calendar-Windows-$TAG-Setup.exe.sig" \
+            "Nancy-Calendar-Windows-$TAG.msi" "Nancy-Calendar-Windows-$TAG.msi.sig" \
+            latest.json SHA256SUMS-Windows.txt
+          gh release view "$TAG" --json body --jq .body > /tmp/body.md
+          cat RELEASE_NOTES-Windows.md >> /tmp/body.md
+          gh release edit "$TAG" --notes-file /tmp/body.md
+
+      - name: Verify public download
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          for i in 1 2 3 4 5 6; do
+            curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json" -o /tmp/latest.json \
+              && [ "v$(node -p 'require("/tmp/latest.json").version')" = "$TAG" ] && break
+            sleep 10
+          done
+          [ "v$(node -p 'require("/tmp/latest.json").version')" = "$TAG" ]
+          curl -fsSL "$(node -p 'require("/tmp/latest.json").platforms["windows-x86_64"].url')" -o /tmp/setup.exe
+          node -p 'require("/tmp/latest.json").platforms["windows-x86_64"].signature' > /tmp/setup.sig
+          node scripts/verify-updater-signature.mjs /tmp/setup.exe /tmp/setup.sig
+          # Android version.json vẫn nguyên vẹn trên release mới nhất.
+          curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/version.json" -o /tmp/version.json
+          [ "v$(node -p 'require("/tmp/version.json").version')" = "$TAG" ]
+
+      - name: Delete incoming branch
+        if: always()
+        run: git push origin --delete "$GITHUB_REF_NAME" || true
